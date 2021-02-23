@@ -1,0 +1,191 @@
+name: microk8s
+version-script: |
+  . build-scripts/prepare-env.sh > /dev/null
+  echo $KUBE_VERSION
+version: "latest"
+summary: Kubernetes in your box.
+description: Microk8s deploys and configures all kubernetes services in a snap.
+grade: stable
+confinement: classic
+
+apps:
+  daemon-etcd:
+    command: run-etcd-with-args
+    daemon: simple
+  daemon-docker:
+    command: run-docker-with-args
+    daemon: simple
+  daemon-apiserver:
+    command: run-with-config-args kube-apiserver
+    daemon: simple
+  daemon-controller-manager:
+    command: run-with-config-args kube-controller-manager
+    daemon: simple
+  daemon-scheduler:
+    command: run-with-config-args kube-scheduler
+    daemon: simple
+  daemon-kubelet:
+    command: run-with-config-args kubelet
+    daemon: simple
+  daemon-proxy:
+    command: run-with-config-args kube-proxy
+    daemon: simple
+  kubectl:
+    command: kubectl --kubeconfig=$SNAP/client.config
+  docker:
+    command: microk8s-docker.wrapper
+  enable:
+    command: microk8s-enable.wrapper
+  disable:
+    command: microk8s-disable.wrapper
+  config:
+    command: microk8s-config.wrapper
+  reset:
+    command: microk8s-reset.wrapper
+  istioctl:
+    command: istioctl --kubeconfig=$SNAP/client.config
+
+parts:
+  libnftnl:
+    plugin: autotools
+    source: https://www.netfilter.org/projects/libnftnl/files/libnftnl-1.0.9.tar.bz2
+    build-packages:
+    - libjansson-dev
+    - libmnl-dev
+  iptables:
+    after:
+    - libnftnl
+    source: https://www.netfilter.org/projects/iptables/files/iptables-1.6.1.tar.bz2
+    plugin: autotools
+    build-packages:
+    - bison
+    - flex
+    - libmnl-dev
+    - libnfnetlink-dev
+    - libnetfilter-conntrack3
+    - libnetfilter-conntrack-dev
+    configflags:
+    - "--disable-shared"
+    - "--enable-static"
+    prime: [ -bin/iptables-xml ]
+  docker:
+    after: [iptables]
+    plugin: dump
+    stage-packages:
+    - conntrack
+    - docker.io
+    - aufs-tools
+    - gawk
+    - sed
+    source: .
+    stage:
+    - -sbin/xtables-multi
+    - -sbin/iptables*
+    - -lib/xtables
+    override-build: "true"
+  microk8s:
+    after: [docker]
+    plugin: dump
+    build-attributes: [no-patchelf]
+    build-packages:
+    - curl
+    - openssl
+    - file
+    stage-packages:
+    - util-linux
+    - socat
+    source: .
+    override-build: |
+      set -eu
+      . build-scripts/prepare-env.sh
+
+      if [ -z "$KUBE_SNAP_BINS" ]; then
+        echo "Downloading binaries from upstream"
+        # Also sets KUBE_SNAP_BINS
+        . build-scripts/fetch-binaries.sh
+      fi
+
+      echo "Setting default daemon configs"
+      cp -r $KUBE_SNAP_ROOT/microk8s-resources/default-args .
+
+      echo "Building certs"
+      build-scripts/build-certs.sh
+      cp -r $KUBE_SNAP_ROOT/microk8s-resources/certs-beta .
+
+      echo "Preparing cni"
+      mkdir -p opt/cni/bin/
+      cp $KUBE_SNAP_BINS/cni/* opt/cni/bin/
+
+      echo "Preparing dockerd"
+      cp $KUBE_SNAP_ROOT/microk8s-resources/docker-profile .
+
+      echo "Preparing etcd"
+      cp $KUBE_SNAP_BINS/etcd/etcd .
+      cp $KUBE_SNAP_BINS/etcd/etcdctl .
+
+      echo "Preparing kube-apiserver"
+      cp $KUBE_SNAP_BINS/$KUBE_ARCH/kube-apiserver .
+      cp $KUBE_SNAP_ROOT/microk8s-resources/known_token.csv .
+      cp $KUBE_SNAP_ROOT/microk8s-resources/basic_auth.csv .
+
+      echo "Preparing kube-controller-manager"
+      cp $KUBE_SNAP_BINS/$KUBE_ARCH/kube-controller-manager .
+
+      echo "Preparing kube-scheduler"
+      cp $KUBE_SNAP_BINS/$KUBE_ARCH/kube-scheduler .
+
+      echo "Preparing kubelet"
+      mkdir -p configs
+      cp $KUBE_SNAP_BINS/$KUBE_ARCH/kubelet .
+      cp $KUBE_SNAP_ROOT/microk8s-resources/kubelet.config ./configs/
+
+      echo "Preparing kube-proxy"
+      cp $KUBE_SNAP_BINS/$KUBE_ARCH/kube-proxy .
+      cp $KUBE_SNAP_ROOT/microk8s-resources/kubeproxy.config .
+
+      echo "Preparing kubelet"
+      cp $KUBE_SNAP_BINS/$KUBE_ARCH/kubectl .
+
+      echo "Preparing user config"
+      cp $KUBE_SNAP_ROOT/microk8s-resources/client.config .
+
+      echo "Preparing istio"
+      cp $KUBE_SNAP_BINS/istioctl .
+
+      echo "Creating commands and wrappers"
+      cp $KUBE_SNAP_ROOT/microk8s-resources/wrappers/* .
+      #TODO(kjackal): yaml manifests may need to be rendered to match the $SNAP_ARCH
+      cp -r $KUBE_SNAP_ROOT/microk8s-resources/actions .
+      # Istio addon
+      mv $KUBE_SNAP_BINS/istio-yaml ./actions/istio
+      snapcraftctl build
+
+  # Unfortunately we cannot add package repositories to our snaps
+  # https://forum.snapcraft.io/t/proposal-additional-package-sources/2199
+  # We handpick the debs we need.
+  # To update these debs add the repository
+  # Follow the instructions in https://github.com/NVIDIA/nvidia-docker and
+  # install the https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list repo.
+  # Use apt-cache show <package> to make sure
+  # a) the dockerd we ship in this snap is supported by nvidia-container-runtime
+  # b) the version dependencies of each package is met.
+  nvidia-runtime:
+    plugin: dump
+    source: https://nvidia.github.io/nvidia-container-runtime/ubuntu16.04/amd64/nvidia-container-runtime_2.0.0+docker17.03.2-1_amd64.deb
+    source-type: deb
+
+  nvidia-runtime-hook:
+    plugin: dump
+    source: https://nvidia.github.io/nvidia-container-runtime/ubuntu16.04/amd64/nvidia-container-runtime-hook_1.4.0-1_amd64.deb
+    source-type: deb
+
+  libnvidia:
+    plugin: dump
+    source: https://nvidia.github.io/libnvidia-container/ubuntu16.04/amd64/libnvidia-container1_1.0.0~rc.2-1_amd64.deb
+    source-type: deb
+
+  libnvidia-tools:
+    plugin: dump
+    source: https://nvidia.github.io/libnvidia-container/ubuntu16.04/amd64/libnvidia-container-tools_1.0.0~rc.2-1_amd64.deb
+    source-type: deb
+
